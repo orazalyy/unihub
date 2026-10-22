@@ -7,6 +7,9 @@ qa/
 **/*.log
 .vercel/
 .venv/
+promo/out/
+promo/assets/session.txt
 
 .vercel
 .env*
+report/B2/*.har

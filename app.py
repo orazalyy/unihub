@@ -236,6 +236,15 @@ def api_dispatch(subpath):
             u = current_user()
             if not u: return send_json(401, {"error": "Not signed in"})
             return send_json(200, get_all(u["id"]))
+        m = re.fullmatch(r"/api/products/(\d+)/image", path)
+        if m:
+            if not current_user(): return send_json(401, {"error": "Not signed in"})
+            img = features.product_image(int(m[1]))
+            if not img: return send_json(404, {"error": "No photo"})
+            resp = app.response_class(img[1], mimetype=img[0])
+            resp.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+            resp.headers["X-Content-Type-Options"] = "nosniff"
+            return resp
         return send_json(404, {"error": "Not found"})
 
     if request.method == "DELETE":

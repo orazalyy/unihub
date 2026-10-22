@@ -76,6 +76,11 @@ class Integration(unittest.TestCase):
   d.update(status='Sold',image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=')
   self.a.req('POST',f'/api/products/{pid}/edit',d);p=next(p for p in self.b.req('GET','/api/data')['products'] if p['id']==pid);self.assertEqual(p['status'],'Sold');self.assertTrue(p['image'])
   self.b.req('POST',f'/api/products/{pid}/edit',d,404);d['image']='javascript:alert(1)';self.a.req('POST',f'/api/products/{pid}/edit',d,400)
+  url=p['image'];self.assertTrue(url.startswith(f'/api/products/{pid}/image?v='));self.assertNotIn('base64',json.dumps(self.b.req('GET','/api/data')))
+  self.assertTrue(self.b.req('GET',url).startswith(b'\x89PNG'));Client(self.base).req('GET',url,expected=401)
+  self.a.req('POST',f'/api/products/{pid}/edit',dict(d,image='',keep_image=True,status='Available'))
+  self.assertEqual(next(p for p in self.a.req('GET','/api/data')['products'] if p['id']==pid)['image'],url)
+  r=urllib.request.urlopen(urllib.request.Request(self.base+'/app.js',headers={'Accept-Encoding':'gzip'}));self.assertEqual(r.headers['Content-Encoding'],'gzip');r.close()
  def test_profile_password_and_session_revocation(self):
   d=dict(first_name='Alice',last_name='Updated',university='ENU',email='alice@example.test',bio='Hello',interests='Python')
   self.a.req('POST','/api/profile',d);self.a.req('POST','/api/community',{'university':'MNU'});self.assertEqual(self.a.req('GET','/api/me')['community'],'MNU')

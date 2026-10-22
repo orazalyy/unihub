@@ -24,6 +24,19 @@ def init(c):
 def public(u):
     return {'id':u['id'],'name':s.short_name(u['first_name'],u['last_name']),'university':u['university'],'bio':u['bio'],'interests':u['interests']}
 
+IMAGE_RE = re.compile(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)')
+
+def image_url(pid, image):
+    # Photos are served from their own cacheable URL instead of being inlined into /api/data;
+    # the hash changes whenever the photo does, so the long browser cache can never go stale.
+    return f'/api/products/{pid}/image?v={hashlib.sha1(image.encode()).hexdigest()[:10]}' if image else ''
+
+def product_image(pid):
+    with s.connect() as c:
+        r = c.execute('SELECT image FROM products WHERE id=? AND user_id IS NOT NULL', (pid,)).fetchone()
+    m = IMAGE_RE.fullmatch(r['image']) if r and r['image'] else None
+    return ('image/' + m[1], base64.b64decode(m[2])) if m else None
+
 def notify(c, uid, text, href):
     c.execute('INSERT INTO notifications(user_id,text,href,created_at) VALUES(?,?,?,?)',(uid,text,href,int(time.time())))
 
@@ -40,7 +53,7 @@ def data(c, me):
         posts.append(p)
     products=[]
     for r in c.execute('SELECT * FROM products WHERE user_id IS NOT NULL ORDER BY id DESC'):
-        p=s.product_json(r,me);p.update(user_id=r['user_id'],seller=users[r['user_id']]['name'],image=r['image'],status=r['status']);products.append(p)
+        p=s.product_json(r,me);p.update(user_id=r['user_id'],seller=users[r['user_id']]['name'],image=image_url(r['id'],r['image']),status=r['status']);products.append(p)
     result={k:[] for k in KINDS}
     for r in c.execute('SELECT * FROM entries ORDER BY id DESC'):
         p=json.loads(r['payload']);p.update(id=r['id'],user_id=r['user_id'],university=r['university'],mine=r['user_id']==me,owner=users[r['user_id']]['name'],created_at=r['created_at'])
@@ -141,11 +154,12 @@ def post(path,d,me):
             return 200,{'ok':True}
         m=re.fullmatch(r'/api/products/(\d+)/edit',path)
         if m:
-            if not c.execute('SELECT 1 FROM products WHERE id=? AND user_id=?',(int(m[1]),uid)).fetchone():raise s.Bad('Listing not found',code=404)
-            image=d.get('image','')
+            row=c.execute('SELECT image FROM products WHERE id=? AND user_id=?',(int(m[1]),uid)).fetchone()
+            if not row:raise s.Bad('Listing not found',code=404)
+            image=row['image'] if d.get('keep_image') is True else d.get('image','')
             if not isinstance(image,str) or len(image)>2800000:raise s.Bad('Image must be smaller than 2 MB')
-            if image:
-                mm=re.fullmatch(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)',image)
+            if image and d.get('keep_image') is not True:
+                mm=IMAGE_RE.fullmatch(image)
                 if not mm:raise s.Bad('Upload a PNG, JPEG or WebP image')
                 try: raw=base64.b64decode(mm[2],validate=True)
                 except ValueError:raise s.Bad('Invalid image')

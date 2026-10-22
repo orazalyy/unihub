@@ -1,5 +1,5 @@
 """UniHub: локальный сервер + SQLite. Только стандартная библиотека Python (pip ничего ставить не нужно)."""
-import json, sqlite3, time, mimetypes, os, sys, re, hashlib, hmac, secrets, datetime
+import json, sqlite3, time, mimetypes, os, sys, re, hashlib, hmac, secrets, datetime, gzip
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -142,15 +142,22 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         sys.stderr.write("  %s\n" % (fmt % a))
 
+    def send_body(self, body, compressible):
+        if compressible and len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            body = gzip.compress(body, 6)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_json(self, code, obj, cookie=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         if cookie: self.send_header("Set-Cookie", cookie)
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_body(body, True)
 
     def body(self):
         if "application/json" not in (self.headers.get("Content-Type") or ""):
@@ -191,6 +198,16 @@ class H(BaseHTTPRequestHandler):
             u = self.user()
             if not u: return self.send_json(401, {"error": "Not signed in"})
             return self.send_json(200, get_all(u["id"]))
+        m = re.fullmatch(r"/api/products/(\d+)/image", path)
+        if m:
+            if not self.user(): return self.send_json(401, {"error": "Not signed in"})
+            img = features.product_image(int(m[1]))
+            if not img: return self.send_json(404, {"error": "No photo"})
+            self.send_response(200)
+            self.send_header("Content-Type", img[0])
+            self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            return self.send_body(img[1], False)
         if path == "/": path = "/index.html"
         if path.endswith(".html") and path not in PUBLIC_PAGES and not self.user():
             self.send_response(302); self.send_header("Location", "/login.html"); self.end_headers(); return
@@ -200,12 +217,10 @@ class H(BaseHTTPRequestHandler):
         data = open(f, "rb").read()
         self.send_response(200)
         self.send_header("Content-Type", (mimetypes.guess_type(f)[0] or "application/octet-stream") + ("; charset=utf-8" if f.endswith((".html", ".js", ".css")) else ""))
-        self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
-        self.end_headers()
-        self.wfile.write(data)
+        self.send_body(data, f.endswith((".html", ".js", ".css", ".json", ".webmanifest", ".svg", ".vtt")))
 
     def register(self, d):
         first = need_str(d, "first_name", 50); last = need_str(d, "last_name", 50)
