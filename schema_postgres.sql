@@ -73,6 +73,25 @@ CREATE TABLE IF NOT EXISTS notifications(
   id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, href TEXT NOT NULL,
   created_at BIGINT NOT NULL, read_at BIGINT
 );
+-- Added for Project Stage 2 (R1 email verification, R7 moderation). ALTER ... IF NOT
+-- EXISTS upgrades the live database in place; on an empty one it is a no-op.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at BIGINT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'student';
+CREATE TABLE IF NOT EXISTS email_codes(
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, email TEXT NOT NULL,
+  code_hash TEXT NOT NULL, expires_at BIGINT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+  sent_at BIGINT NOT NULL, window_start BIGINT NOT NULL, sends INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS reports(
+  id SERIAL PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, reason TEXT NOT NULL,
+  created_at BIGINT NOT NULL, UNIQUE(post_id,user_id)
+);
+CREATE TABLE IF NOT EXISTS moderation_log(
+  id SERIAL PRIMARY KEY, admin_id INTEGER REFERENCES users(id) ON DELETE SET NULL, action TEXT NOT NULL,
+  target_kind TEXT NOT NULL, target_id INTEGER NOT NULL, author_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  excerpt TEXT NOT NULL, reason TEXT NOT NULL, created_at BIGINT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id,id);
 CREATE INDEX IF NOT EXISTS entries_kind ON entries(kind,university);
 CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id,id);

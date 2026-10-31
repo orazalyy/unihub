@@ -4,12 +4,13 @@ match with the original -- only the schema-bootstrap function is gone, since
 on this deployment the full schema (schema_postgres.sql) is applied once up
 front instead of being migrated incrementally onto a long-lived SQLite file.
 """
-import json, re, time, datetime, hashlib, hmac, os, base64
+import json, re, time, datetime, hashlib, hmac, os, base64, secrets, smtplib, sys
+from email.message import EmailMessage
 s = None
 KINDS = {'students','roommates','events','lost','opportunities','discounts','clubs','groups'}
 
 def public(u):
-    return {'id':u['id'],'name':s.short_name(u['first_name'],u['last_name']),'university':u['university'],'bio':u['bio'],'interests':u['interests']}
+    return {'id':u['id'],'name':s.short_name(u['first_name'],u['last_name']),'university':u['university'],'bio':u['bio'],'interests':u['interests'],'verified':bool(u['email_verified_at'])}
 
 IMAGE_RE = re.compile(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)')
 
@@ -52,7 +53,8 @@ def data(c, me):
     messages=[dict(r) for r in c.execute('SELECT * FROM messages WHERE sender_id=? OR recipient_id=? ORDER BY id',(me,me))]
     result.update(posts=posts,products=products,comments=comments,users=list(users.values()),following=list(following),messages=messages,
                   notifications=[dict(r) for r in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 100',(me,))],
-                  counts={u:c.execute('SELECT count(*) FROM users WHERE university=?',(u,)).fetchone()[0] for u in s.UNIVERSITIES})
+                  counts={u:c.execute('SELECT count(*) FROM users WHERE university=?',(u,)).fetchone()[0] for u in s.UNIVERSITIES},
+                  mail_ready=s.MAIL_DEV or bool(os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASSWORD')))
     return result
 
 def text(d,k,limit=500): return s.need_str(d,k,limit)
@@ -99,7 +101,8 @@ def post(path,d,me):
             if not isinstance(email,str) or len(email)>120 or (email and not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',email)):raise s.Bad('Enter a valid email','email')
             bio=d.get('bio','');interests=d.get('interests','')
             if not isinstance(bio,str) or len(bio)>2000 or not isinstance(interests,str) or len(interests)>200:raise s.Bad('Profile text is too long')
-            c.execute('UPDATE users SET first_name=?,last_name=?,university=?,email=?,bio=?,interests=? WHERE id=?',(first,last,university,email,bio,interests,uid))
+            verified_at=me['email_verified_at'] if email.strip().lower()==(me['email'] or '').strip().lower() else None  # a new address must be confirmed again
+            c.execute('UPDATE users SET first_name=?,last_name=?,university=?,email=?,email_verified_at=?,bio=?,interests=? WHERE id=?',(first,last,university,email,verified_at,bio,interests,uid))
             return 200,s.user_json(c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone())
         if path=='/api/community':
             c.execute('UPDATE users SET community=? WHERE id=?',(choice(d,'university',s.UNIVERSITIES),uid));return 200,{'ok':True}
@@ -125,7 +128,7 @@ def post(path,d,me):
             if c.execute('SELECT 1 FROM follows WHERE user_id=? AND target_id=?',(uid,other)).fetchone():c.execute('DELETE FROM follows WHERE user_id=? AND target_id=?',(uid,other))
             else:c.execute('INSERT INTO follows VALUES(?,?)',(uid,other))
             return 200,{'ok':True}
-        m=re.fullmatch(r'/api/posts/(\d+)/(like|comments|edit)',path)
+        m=re.fullmatch(r'/api/posts/(\d+)/(like|comments|edit|report)',path)
         if m:
             pid=int(m[1]);p=c.execute('SELECT * FROM posts WHERE id=? AND user_id IS NOT NULL',(pid,)).fetchone()
             if not p:raise s.Bad('Post not found',code=404)
@@ -135,6 +138,11 @@ def post(path,d,me):
             elif m[2]=='edit':
                 if p['user_id']!=uid:raise s.Bad('Only the author can edit this post',code=403)
                 c.execute('UPDATE posts SET text=?,category=? WHERE id=?',(text(d,'text',500),choice(d,'category',s.CATEGORIES_POST),pid))
+            elif m[2]=='report':
+                if p['user_id']==uid:raise s.Bad('You cannot report your own post')
+                reason=choice(d,'reason',REASONS)
+                if c.execute('SELECT 1 FROM reports WHERE post_id=? AND user_id=?',(pid,uid)).fetchone():raise s.Bad('You have already reported this post',code=409)
+                c.execute('INSERT INTO reports(post_id,user_id,reason,created_at) VALUES(?,?,?,?)',(pid,uid,reason,now))
             else:
                 c.execute('INSERT INTO comments(user_id,post_id,text,created_at) VALUES(?,?,?,?)',(uid,pid,text(d,'text',2000),now))
                 if p['user_id']!=uid:notify(c,p['user_id'],me['first_name']+' replied to your post','feed.html?post='+str(pid))
@@ -181,6 +189,24 @@ def post(path,d,me):
                 c.execute('INSERT INTO responses VALUES(?,?,?)',(uid,eid,status))
                 if r['user_id']!=uid:notify(c,r['user_id'],me['first_name']+': '+status+' — '+p['name'],{'events':'events','groups':'studymate','clubs':'university','opportunities':'opportunities','discounts':'discounts'}[r['kind']]+'.html')
             return 200,{'ok':True}
+        m=re.fullmatch(r'/api/admin/(posts|products)/(\d+)/(remove|dismiss)',path)
+        if m:
+            if not is_admin(me):raise s.Bad('Moderators only',code=403)
+            row=c.execute('SELECT * FROM '+m[1]+' WHERE id=? AND user_id IS NOT NULL',(int(m[2]),)).fetchone()
+            if not row:raise s.Bad('Record not found',code=404)
+            kind=m[1][:-1];excerpt=(row['text'] if kind=='post' else row['name'])[:200]
+            if m[3]=='dismiss':
+                if kind!='post' or not c.execute('DELETE FROM reports WHERE post_id=?',(row['id'],)).rowcount:raise s.Bad('This post has no open reports',code=404)
+                reason='Reports reviewed, post kept'
+            else:
+                reason=choice(d,'reason',REASONS)
+                c.execute('DELETE FROM '+m[1]+' WHERE id=?',(row['id'],))
+                if row['user_id']!=uid:notify(c,row['user_id'],f'A moderator removed your {kind} ({reason}): {excerpt[:60]}','notifications.html')
+            c.execute('INSERT INTO moderation_log(admin_id,action,target_kind,target_id,author_id,excerpt,reason,created_at) VALUES(?,?,?,?,?,?,?,?)',
+                      (uid,'removed' if m[3]=='remove' else 'kept',kind,row['id'],row['user_id'],excerpt,reason,now))
+            return 200,{'ok':True}
+    if path=='/api/email/send-code':return send_code(d,me)
+    if path=='/api/email/verify':return verify_code(d,me)
     return None
 
 def delete(path,me):
@@ -189,3 +215,110 @@ def delete(path,me):
     with s.connect() as c:
         cur=c.execute('DELETE FROM '+m[1]+' WHERE id=? AND user_id=?',(int(m[2]),me['id']))
     return (200,{'deleted':1}) if cur.rowcount else (404,{'error':'Record not found'})
+
+# ---- R1: email verification by one-time code --------------------------------
+CODE_TTL=600;CODE_COOLDOWN=60;SENDS_PER_HOUR=5;MAX_ATTEMPTS=5
+EMAIL_RE=re.compile(r'[^@\s]+@[^@\s]+\.[^@\s]+')
+
+def code_hash(uid,code): return hashlib.sha256(f'{uid}:{code}'.encode()).hexdigest()
+
+def send_mail(to,subject,body):
+    user=os.environ.get('SMTP_USER');password=os.environ.get('SMTP_PASSWORD')
+    if not user or not password:
+        if not s.MAIL_DEV:raise s.Bad('Email sending is not configured on this server',code=503)
+        print(f'[mail] to {to}: {subject}',file=sys.stderr,flush=True)  # local/demo server: the "email" appears in the console
+        if os.environ.get('UNIHUB_MAIL_OUTBOX'):
+            with open(os.environ['UNIHUB_MAIL_OUTBOX'],'a',encoding='utf-8') as f:f.write(json.dumps({'to':to,'subject':subject,'body':body})+'\n')
+        return
+    msg=EmailMessage();msg['Subject']=subject;msg['From']=os.environ.get('SMTP_FROM') or f'UniHub <{user}>';msg['To']=to;msg.set_content(body)
+    try:
+        with smtplib.SMTP_SSL(os.environ.get('SMTP_HOST','smtp.gmail.com'),int(os.environ.get('SMTP_PORT','465')),timeout=15) as smtp:
+            smtp.login(user,password);smtp.send_message(msg)
+    except (OSError,smtplib.SMTPException) as e:
+        print('[mail] failed:',repr(e),file=sys.stderr,flush=True);raise s.Bad('Could not send the email. Check the address and try again.','email',502)
+
+def send_code(d,me):
+    email=d.get('email');uid=me['id'];now=int(time.time())
+    if not isinstance(email,str) or len(email.strip())>120 or not EMAIL_RE.fullmatch(email.strip()):raise s.Bad('Enter a valid email','email')
+    email=email.strip()
+    if me['email_verified_at'] and email.lower()==(me['email'] or '').lower():raise s.Bad('This email is already verified','email')
+    with s.connect() as c:
+        taken=c.execute('SELECT 1 FROM users WHERE lower(email)=lower(?) AND email_verified_at IS NOT NULL AND id!=?',(email,uid)).fetchone()
+        r=c.execute('SELECT * FROM email_codes WHERE user_id=?',(uid,)).fetchone()
+    if taken:raise s.Bad('This email is already verified on another account','email',409)
+    if r and now-r['sent_at']<CODE_COOLDOWN:raise s.Bad(f"Wait {CODE_COOLDOWN-(now-r['sent_at'])} s before requesting a new code",None,429)
+    window,sends=(r['window_start'],r['sends']) if r and now-r['window_start']<3600 else (now,0)
+    if sends>=SENDS_PER_HOUR:raise s.Bad('Too many codes requested. Try again in an hour.',None,429)
+    code=f'{secrets.randbelow(10**6):06d}'
+    # Send first, store after: a failed delivery leaves nothing behind and does not start the cooldown.
+    send_mail(email,f'{code} is your UniHub verification code',
+              f"Hi {me['first_name']},\n\nYour UniHub verification code is {code}.\nIt expires in 10 minutes.\n\n"
+              "If you did not request it, you can ignore this email.\n\nUniHub")
+    with s.connect() as c:
+        c.execute('DELETE FROM email_codes WHERE user_id=?',(uid,))
+        c.execute('INSERT INTO email_codes(user_id,email,code_hash,expires_at,attempts,sent_at,window_start,sends) VALUES(?,?,?,?,0,?,?,?)',
+                  (uid,email,code_hash(uid,code),now+CODE_TTL,now,window,sends+1))
+    return 200,{'sent':True,'email':email,'expires_in':CODE_TTL}
+
+def verify_code(d,me):
+    code=d.get('code');uid=me['id'];now=int(time.time())
+    if not isinstance(code,str) or not re.fullmatch(r'\d{6}',code.strip()):raise s.Bad('Enter the 6-digit code','code')
+    error=None
+    with s.connect() as c:  # errors are raised after the block, so the attempt counter is committed
+        r=c.execute('SELECT * FROM email_codes WHERE user_id=?',(uid,)).fetchone()
+        if not r or r['expires_at']<now:error=('The code has expired. Request a new one.',400)
+        elif r['attempts']>=MAX_ATTEMPTS:error=('Too many wrong attempts. Request a new code.',429)
+        elif not hmac.compare_digest(code_hash(uid,code.strip()),r['code_hash']):
+            c.execute('UPDATE email_codes SET attempts=attempts+1 WHERE user_id=?',(uid,))
+            left=MAX_ATTEMPTS-r['attempts']-1;error=(f'Wrong code. {left} attempts left.' if left else 'Wrong code. Request a new one.',400)
+        elif c.execute('SELECT 1 FROM users WHERE lower(email)=lower(?) AND email_verified_at IS NOT NULL AND id!=?',(r['email'],uid)).fetchone():
+            error=('This email is already verified on another account',409)
+        else:
+            c.execute('UPDATE users SET email=?,email_verified_at=? WHERE id=?',(r['email'],now,uid))
+            c.execute('DELETE FROM email_codes WHERE user_id=?',(uid,))
+            u=c.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+    if error:raise s.Bad(error[0],'code',error[1])
+    return 200,s.user_json(u)
+
+# ---- R7: reports, moderation and the statistics panel ------------------------
+REASONS={'Spam','Harassment','Inappropriate','Misinformation','Other'}
+
+def is_admin(u): return u is not None and u['role']=='admin'
+
+def grant_admins(c):
+    for login in filter(None,(x.strip() for x in os.environ.get('ADMIN_LOGINS','').split(','))):
+        c.execute("UPDATE users SET role='admin' WHERE login=?",(login,))
+
+# Calendar day in Kazakhstan time (UTC+5) for an epoch-seconds column; the two databases spell it differently.
+def DAY(col): return f"to_char(to_timestamp({col}+18000) AT TIME ZONE 'UTC','YYYY-MM-DD')" if getattr(s,'POSTGRES',False) else f"date({col}+18000,'unixepoch')"
+def DAY_NOW(): return time.strftime('%Y-%m-%d',time.gmtime(time.time()+18000))
+
+# Engagement per feed category: likes and comments are pre-aggregated per post so the joins cannot multiply rows.
+CATEGORY_SQL='''SELECT p.category, COUNT(*) AS posts, COALESCE(SUM(l.n),0) AS likes, COALESCE(SUM(k.n),0) AS comments
+FROM posts p
+LEFT JOIN (SELECT post_id, COUNT(*) AS n FROM reactions GROUP BY post_id) l ON l.post_id = p.id
+LEFT JOIN (SELECT post_id, COUNT(*) AS n FROM comments GROUP BY post_id) k ON k.post_id = p.id
+WHERE p.user_id IS NOT NULL GROUP BY p.category ORDER BY posts DESC, p.category'''
+MARKET_SQL='''SELECT category, COUNT(*) AS listings, AVG(price) AS avg_price, SUM(CASE WHEN status = 'Sold' THEN 1 ELSE 0 END) AS sold
+FROM products WHERE user_id IS NOT NULL GROUP BY category ORDER BY listings DESC, category'''
+
+def admin(me):
+    if not is_admin(me):return 403,{'error':'Moderators only'}
+    since=(int(time.time())+18000)//86400*86400-18000-13*86400  # local midnight 13 days ago: a 14-day window
+    with s.connect() as c:
+        one=lambda q,a=():int(c.execute(q,a).fetchone()[0])
+        reports=[]
+        for r in c.execute('SELECT post_id,COUNT(*) AS n,MAX(created_at) AS last_at FROM reports GROUP BY post_id ORDER BY n DESC,last_at DESC').fetchall():
+            p=c.execute('SELECT p.*,u.first_name,u.last_name FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=?',(r['post_id'],)).fetchone()
+            reasons={x['reason']:int(x['n']) for x in c.execute('SELECT reason,COUNT(*) AS n FROM reports WHERE post_id=? GROUP BY reason ORDER BY n DESC',(r['post_id'],))}
+            reports.append({'post_id':p['id'],'text':p['text'],'category':p['category'],'university':p['university'],'author':s.short_name(p['first_name'],p['last_name']),
+                            'author_id':p['user_id'],'count':int(r['n']),'last_at':r['last_at'],'reasons':reasons})
+        log=[dict(r) for r in c.execute('SELECT m.action,m.target_kind,m.excerpt,m.reason,m.created_at,u.first_name AS admin FROM moderation_log m LEFT JOIN users u ON u.id=m.admin_id ORDER BY m.id DESC LIMIT 30')]
+        totals={'users':one('SELECT COUNT(*) FROM users'),'verified':one('SELECT COUNT(*) FROM users WHERE email_verified_at IS NOT NULL'),
+                'posts':one('SELECT COUNT(*) FROM posts WHERE user_id IS NOT NULL'),'listings':one('SELECT COUNT(*) FROM products WHERE user_id IS NOT NULL'),
+                'comments':one('SELECT COUNT(*) FROM comments'),'likes':one('SELECT COUNT(*) FROM reactions'),'open_reports':len(reports)}
+        categories=[{'category':r['category'],'posts':int(r['posts']),'likes':int(r['likes']),'comments':int(r['comments'])} for r in c.execute(CATEGORY_SQL)]
+        market=[{'category':r['category'],'listings':int(r['listings']),'avg_price':round(float(r['avg_price'] or 0)),'sold':int(r['sold'])} for r in c.execute(MARKET_SQL)]
+        days={'posts':{r['day']:int(r['n']) for r in c.execute(f"SELECT {DAY('sort_key')} AS day,COUNT(*) AS n FROM posts WHERE user_id IS NOT NULL AND sort_key>=? GROUP BY day",(since,))},
+              'users':{r['day']:int(r['n']) for r in c.execute(f"SELECT {DAY('created_at')} AS day,COUNT(*) AS n FROM users WHERE created_at>=? GROUP BY day",(since,))}}
+    return 200,{'reports':reports,'log':log,'stats':{'totals':totals,'categories':categories,'market':market,'days':days,'today':DAY_NOW()}}

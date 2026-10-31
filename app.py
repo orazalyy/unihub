@@ -19,6 +19,9 @@ app.json.ensure_ascii = False
 CATEGORIES_POST = {"Study", "Question", "Housing", "Marketplace", "Events", "Campus Life"}
 CATEGORIES_PRODUCT = {"Electronics", "Books", "Dorm stuff", "Clothes", "Other"}
 UNIVERSITIES = {"AITU", "ENU", "MNU", "Nazarbayev University", "Other"}
+POSTGRES = True
+# Production must send real email (SMTP_* env vars); MAIL_DEV=1 only for a local run of this app.
+MAIL_DEV = os.environ.get("MAIL_DEV") == "1"
 
 SESSION_TTL = 30 * 24 * 3600
 fails = {}  # (login, ip) -> [timestamps]; per-instance only, see README-VERCEL.md
@@ -33,6 +36,7 @@ def ensure_schema():
         return
     with connect() as c:
         c.executescript(_SCHEMA_SQL)
+        features.grant_admins(c)  # ADMIN_LOGINS env var, e.g. "orazaly"
     _schema_ready = True
 
 
@@ -50,6 +54,7 @@ def short_name(first, last):
 def user_json(u):
     return {"bio": u["bio"], "interests": u["interests"], "community": u["community"] or u["university"], "id": u["id"], "first_name": u["first_name"], "last_name": u["last_name"], "birth_date": u["birth_date"],
             "university": u["university"], "login": u["login"], "email": u["email"], "created_at": u["created_at"],
+            "email_verified": bool(u["email_verified_at"]), "role": u["role"],
             "short_name": short_name(u["first_name"], u["last_name"])}
 
 
@@ -236,6 +241,9 @@ def api_dispatch(subpath):
             u = current_user()
             if not u: return send_json(401, {"error": "Not signed in"})
             return send_json(200, get_all(u["id"]))
+        if path == "/api/admin":
+            u = current_user()
+            return send_json(*features.admin(u)) if u else send_json(401, {"error": "Not signed in"})
         m = re.fullmatch(r"/api/products/(\d+)/image", path)
         if m:
             if not current_user(): return send_json(401, {"error": "Not signed in"})

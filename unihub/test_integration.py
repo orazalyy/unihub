@@ -13,12 +13,13 @@ class Client:
 class Integration(unittest.TestCase):
  @classmethod
  def setUpClass(cls):
-  cls.tmp=tempfile.TemporaryDirectory();cls.db=os.path.join(cls.tmp.name,'test.db')
+  cls.tmp=tempfile.TemporaryDirectory();cls.db=os.path.join(cls.tmp.name,'test.db');cls.outbox=os.path.join(cls.tmp.name,'outbox.jsonl')
   with socket.socket() as sock:sock.bind(('127.0.0.1',0));cls.port=sock.getsockname()[1]
   cls.base=f'http://127.0.0.1:{cls.port}';cls.start()
  @classmethod
  def start(cls):
-  cls.proc=subprocess.Popen([sys.executable,str(ROOT/'server.py')],env={**os.environ,'PORT':str(cls.port),'UNIHUB_DB':cls.db},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  env={k:v for k,v in os.environ.items() if not k.startswith('SMTP_')}  # never send real mail from tests
+  cls.proc=subprocess.Popen([sys.executable,str(ROOT/'server.py')],env={**env,'PORT':str(cls.port),'UNIHUB_DB':cls.db,'UNIHUB_MAIL_OUTBOX':cls.outbox},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
   for _ in range(100):
    try:urllib.request.urlopen(cls.base+'/login.html');return
    except OSError:time.sleep(.05)
@@ -91,6 +92,48 @@ class Integration(unittest.TestCase):
   pid=self.post();eid,_=self.entry('events');self.b.req('POST',f'/api/entries/{eid}/response',{'status':'Going'})
   type(self).proc.terminate();type(self).proc.wait();type(self).start()
   self.assertTrue(any(p['id']==pid for p in self.a.req('GET','/api/data')['posts']));self.assertEqual(next(p for p in self.b.req('GET','/api/data')['events'] if p['id']==eid)['response'],'Going')
+ def last_code(self,to):
+  mails=[json.loads(l) for l in pathlib.Path(self.outbox).read_text(encoding='utf-8').splitlines()];m=[m for m in mails if m['to']==to][-1]
+  return m['subject'].split()[0]
+ def wait_cooldown(self,uid):
+  with sqlite3.connect(self.db) as c:c.execute('UPDATE email_codes SET sent_at=sent_at-60 WHERE user_id=?',(uid,))
+  c.close()
+ def test_email_verification_by_code(self):
+  mail=f'alice{time.time_ns()}@gmail.com';self.assertFalse(self.a.req('GET','/api/me')['email_verified'])
+  self.a.req('POST','/api/email/send-code',{'email':'not-an-email'},400)
+  self.assertEqual(self.a.req('POST','/api/email/send-code',{'email':mail})['email'],mail);code=self.last_code(mail);self.assertRegex(code,r'^\d{6}$')
+  self.a.req('POST','/api/email/send-code',{'email':mail},429)  # 60 s cooldown between codes
+  self.a.req('POST','/api/email/verify',{'code':'1234'},400);wrong=f'{(int(code)+1)%10**6:06d}'
+  self.assertIn('4 attempts left',self.a.req('POST','/api/email/verify',{'code':wrong},400)['error'])
+  u=self.a.req('POST','/api/email/verify',{'code':code});self.assertTrue(u['email_verified']);self.assertEqual(u['email'],mail)
+  self.assertTrue(next(x for x in self.b.req('GET','/api/data')['users'] if x['id']==self.ua['id'])['verified'])
+  self.a.req('POST','/api/email/verify',{'code':code},400)  # a code works once
+  self.b.req('POST','/api/email/send-code',{'email':mail.upper()},409)  # one verified account per address
+  self.a.req('POST','/api/profile',dict(first_name='Alice',last_name='Tester',university='AITU',email='other@example.test'))
+  self.assertFalse(self.a.req('GET','/api/me')['email_verified'])  # a changed address loses the badge
+  self.b.req('POST','/api/email/send-code',{'email':'boris@example.test'});code=self.last_code('boris@example.test')
+  for _ in range(5):self.b.req('POST','/api/email/verify',{'code':f'{(int(code)+1)%10**6:06d}'},400)
+  self.b.req('POST','/api/email/verify',{'code':code},429)  # locked after 5 wrong attempts
+  self.wait_cooldown(self.ub['id']);self.b.req('POST','/api/email/send-code',{'email':'boris@example.test'})
+  self.b.req('POST','/api/email/verify',{'code':self.last_code('boris@example.test')})
+ def test_reports_and_moderation(self):
+  pid=self.post();self.a.req('POST',f'/api/posts/{pid}/report',{'reason':'Spam'},400)  # not your own post
+  self.b.req('POST',f'/api/posts/{pid}/report',{'reason':'Nonsense'},400);self.b.req('POST',f'/api/posts/{pid}/report',{'reason':'Spam'})
+  self.b.req('POST',f'/api/posts/{pid}/report',{'reason':'Spam'},409)
+  self.b.req('GET','/api/admin',expected=403);self.b.req('POST',f'/api/admin/posts/{pid}/remove',{'reason':'Spam'},403)
+  Client(self.base).req('GET','/api/admin',expected=401)
+  with sqlite3.connect(self.db) as c:c.execute("UPDATE users SET role='admin' WHERE id=?",(self.uc['id'],))
+  c.close();self.assertEqual(self.c.req('GET','/api/me')['role'],'admin')
+  d=self.c.req('GET','/api/admin');r=next(r for r in d['reports'] if r['post_id']==pid);self.assertEqual((r['count'],r['reasons']),(1,{'Spam':1}))
+  self.assertGreaterEqual(d['stats']['totals']['posts'],1);self.assertTrue(any(x['category']=='Study' for x in d['stats']['categories']))
+  self.assertGreaterEqual(d['stats']['days']['posts'].get(d['stats']['today'],0),1)
+  self.c.req('POST',f'/api/admin/posts/{pid}/dismiss',{});self.assertFalse(any(r['post_id']==pid for r in self.c.req('GET','/api/admin')['reports']))
+  self.c.req('POST',f'/api/admin/posts/{pid}/dismiss',{},404);self.c.req('POST',f'/api/admin/posts/{pid}/remove',{'reason':'Wrong'},400)
+  self.c.req('POST',f'/api/admin/posts/{pid}/remove',{'reason':'Spam'});self.assertFalse(any(p['id']==pid for p in self.a.req('GET','/api/data')['posts']))
+  self.assertIn('moderator removed your post',self.a.req('GET','/api/data')['notifications'][0]['text'])
+  pr=self.a.req('POST','/api/products',dict(name='Fake',price=1,category='Other',condition='New',university='AITU'),201)['id']
+  self.c.req('POST',f'/api/admin/products/{pr}/remove',{'reason':'Spam'});self.assertFalse(any(p['id']==pr for p in self.a.req('GET','/api/data')['products']))
+  self.assertEqual([x['action'] for x in self.c.req('GET','/api/admin')['log'][:3]],['removed','removed','kept'])
  def test_routes_and_database_integrity(self):
   for f in (ROOT/'site').glob('*.html'):self.assertIn(b'<!doctype html>',self.a.req('GET','/'+f.name))
   with sqlite3.connect(self.db) as c:self.assertEqual(c.execute('PRAGMA integrity_check').fetchone()[0],'ok');self.assertEqual(c.execute('PRAGMA foreign_key_check').fetchall(),[])

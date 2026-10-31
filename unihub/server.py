@@ -10,6 +10,9 @@ DB_PATH = os.environ.get("UNIHUB_DB", os.path.join(ROOT, "unihub.db"))
 CATEGORIES_POST = {"Study", "Question", "Housing", "Marketplace", "Events", "Campus Life"}
 CATEGORIES_PRODUCT = {"Electronics", "Books", "Dorm stuff", "Clothes", "Other"}
 UNIVERSITIES = {"AITU", "ENU", "MNU", "Nazarbayev University", "Other"}
+POSTGRES = False
+# Without SMTP_USER/SMTP_PASSWORD the local server prints verification emails to the console instead of sending them.
+MAIL_DEV = True
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -86,6 +89,7 @@ def short_name(first, last):
 def user_json(u):
     return {"bio": u["bio"], "interests": u["interests"], "community": u["community"] or u["university"], "id": u["id"], "first_name": u["first_name"], "last_name": u["last_name"], "birth_date": u["birth_date"],
             "university": u["university"], "login": u["login"], "email": u["email"], "created_at": u["created_at"],
+            "email_verified": bool(u["email_verified_at"]), "role": u["role"],
             "short_name": short_name(u["first_name"], u["last_name"])}
 
 def user_from_token(token):
@@ -198,6 +202,9 @@ class H(BaseHTTPRequestHandler):
             u = self.user()
             if not u: return self.send_json(401, {"error": "Not signed in"})
             return self.send_json(200, get_all(u["id"]))
+        if path == "/api/admin":
+            u = self.user()
+            return self.send_json(*features.admin(u)) if u else self.send_json(401, {"error": "Not signed in"})
         m = re.fullmatch(r"/api/products/(\d+)/image", path)
         if m:
             if not self.user(): return self.send_json(401, {"error": "Not signed in"})

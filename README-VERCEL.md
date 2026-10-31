@@ -65,3 +65,10 @@ git add public
   `unihub/features.py`, переведённое на синтаксис Postgres.
 - `build_static.py` — копирует `unihub/site` → `public/`.
 - `verify_postgres.py` — проверка подключения к базе перед/после правок.
+
+## Переменные окружения (Production)
+- `DATABASE_URL` — строка подключения Neon (pooled).
+- `ADMIN_LOGINS` — логины модераторов через запятую; роль `admin` выдаётся при старте функции.
+- `SMTP_USER`, `SMTP_PASSWORD` — ящик, с которого уходят коды подтверждения почты (R1).
+  Необязательно: `SMTP_HOST` (по умолчанию `smtp.gmail.com`), `SMTP_PORT` (`465`, SSL), `SMTP_FROM`.
+  Без них кнопка «Verify email» скрыта, а `/api/email/send-code` отвечает 503.

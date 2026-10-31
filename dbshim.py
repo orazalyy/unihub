@@ -65,7 +65,7 @@ _PRAGMA = re.compile(r"(?is)^\s*PRAGMA\b")
 # cur.lastrowid for free on every table.
 _TABLES_WITH_ID = {
     "users", "posts", "products", "students", "roommates",
-    "entries", "comments", "messages", "notifications",
+    "entries", "comments", "messages", "notifications", "reports", "moderation_log",
 }
 
 

@@ -13,3 +13,8 @@ promo/assets/session.txt
 .vercel
 .env*
 report/B2/*.har
+report/C/clips/
+report/C/*_4032x3024.jpg
+report/C/voice/
+report/C/edit_work/
+report/C/UniHub_demo.mp4
