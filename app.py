@@ -8,7 +8,7 @@ disk. Static HTML pages are served straight from Vercel's CDN (see
 vercel.json / public/), so there is no server-side auth-gate redirect here;
 app.js already falls back to a client-side redirect to login.html on 401.
 """
-import hashlib, hmac, json, os, pathlib, re, secrets, time, datetime, sys
+import hashlib, hmac, json, os, pathlib, re, secrets, threading, time, datetime, sys
 from flask import Flask, request, jsonify
 
 from dbshim import connect, IntegrityError
@@ -28,16 +28,20 @@ fails = {}  # (login, ip) -> [timestamps]; per-instance only, see README-VERCEL.
 
 _SCHEMA_SQL = (pathlib.Path(__file__).parent / "schema_postgres.sql").read_text(encoding="utf-8")
 _schema_ready = False
+_schema_lock = threading.Lock()  # concurrent requests in one instance must not run the schema twice
 
 
 def ensure_schema():
     global _schema_ready
     if _schema_ready:
         return
-    with connect() as c:
-        c.executescript(_SCHEMA_SQL)
-        features.grant_admins(c)  # ADMIN_LOGINS env var, e.g. "orazaly"
-    _schema_ready = True
+    with _schema_lock:
+        if _schema_ready:
+            return
+        with connect() as c:
+            c.executescript(_SCHEMA_SQL)
+            features.grant_admins(c)  # ADMIN_LOGINS env var, e.g. "orazaly"
+        _schema_ready = True
 
 
 def hash_pw(password, salt):

@@ -11,6 +11,7 @@ vercel_features.py / app.py can stay a faithful port instead of a rewrite.
 """
 import os
 import re
+import threading
 import psycopg2
 import psycopg2.extensions
 import psycopg2.extras
@@ -23,14 +24,18 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 IntegrityError = psycopg2.IntegrityError
 
 _pool = None
+_pool_lock = threading.Lock()
 
 
 def _get_pool():
     global _pool
-    if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is not set")
-        _pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL, sslmode="require")
+    # Vercel runs several requests at once in one instance (threads): without the lock two of
+    # them could each create a pool and hand a connection back to the wrong one ("unkeyed").
+    with _pool_lock:
+        if _pool is None:
+            if not DATABASE_URL:
+                raise RuntimeError("DATABASE_URL is not set")
+            _pool = psycopg2.pool.ThreadedConnectionPool(1, 5, DATABASE_URL, sslmode="require")
     return _pool
 
 
