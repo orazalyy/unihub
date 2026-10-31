@@ -18,3 +18,8 @@ report/C/*_4032x3024.jpg
 report/C/voice/
 report/C/edit_work/
 report/C/UniHub_demo.mp4
+
+# Assignment reports and materials stay local, not in the repository
+report/
+promo/
+unihub/screenshots/
