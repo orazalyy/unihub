@@ -205,6 +205,9 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/admin":
             u = self.user()
             return self.send_json(*features.admin(u)) if u else self.send_json(401, {"error": "Not signed in"})
+        if path == "/api/spaces":
+            u = self.user()
+            return self.send_json(*features.spaces(u)) if u else self.send_json(401, {"error": "Not signed in"})
         m = re.fullmatch(r"/api/products/(\d+)/image", path)
         if m:
             if not self.user(): return self.send_json(401, {"error": "Not signed in"})
@@ -291,6 +294,7 @@ class H(BaseHTTPRequestHandler):
                 if t:
                     with connect() as c: c.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(t.encode()).hexdigest(),))
                 return self.send_json(200, {"ok": True}, self.session_cookie("", 0))
+            if path == "/api/iot/readings": return self.send_json(*features.iot_reading(d, self.headers.get("X-IoT-Token")))  # sensor webhook, no session
             me = self.user()
             if not me: raise Bad("Not signed in", None, 401)
             result = features.post(path, d, me)

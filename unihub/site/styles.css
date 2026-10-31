@@ -3002,3 +3002,39 @@ dialog video {
 [data-theme='dark'] .bar-track {
   background: #0f1319;
 }
+
+/* D3: free study rooms (sensor simulation) */
+.room-card .post-head > .badge {
+  margin-left: auto;
+}
+.room-card .badge.red {
+  background: #fdeceb;
+  color: #b4332b;
+}
+.room-meter {
+  display: flex;
+  gap: 4px;
+  margin: 14px 0 6px;
+}
+.room-meter span {
+  flex: 1;
+  height: 8px;
+  border-radius: 4px;
+  background: var(--line);
+}
+.room-meter .green {
+  background: #2f9e76;
+}
+.room-meter .orange {
+  background: #e08a2c;
+}
+.room-meter .red {
+  background: #d4483e;
+}
+.room-card .button {
+  margin-top: 6px;
+}
+[data-theme='dark'] .room-card .badge.red {
+  background: #3a1d1b;
+  color: #ff9b92;
+}

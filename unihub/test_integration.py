@@ -19,7 +19,7 @@ class Integration(unittest.TestCase):
  @classmethod
  def start(cls):
   env={k:v for k,v in os.environ.items() if not k.startswith('SMTP_')}  # never send real mail from tests
-  cls.proc=subprocess.Popen([sys.executable,str(ROOT/'server.py')],env={**env,'PORT':str(cls.port),'UNIHUB_DB':cls.db,'UNIHUB_MAIL_OUTBOX':cls.outbox},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  cls.proc=subprocess.Popen([sys.executable,str(ROOT/'server.py')],env={**env,'PORT':str(cls.port),'UNIHUB_DB':cls.db,'UNIHUB_MAIL_OUTBOX':cls.outbox,'IOT_TOKEN':'test-iot-token'},stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
   for _ in range(100):
    try:urllib.request.urlopen(cls.base+'/login.html');return
    except OSError:time.sleep(.05)
@@ -134,6 +134,21 @@ class Integration(unittest.TestCase):
   pr=self.a.req('POST','/api/products',dict(name='Fake',price=1,category='Other',condition='New',university='AITU'),201)['id']
   self.c.req('POST',f'/api/admin/products/{pr}/remove',{'reason':'Spam'});self.assertFalse(any(p['id']==pr for p in self.a.req('GET','/api/data')['products']))
   self.assertEqual([x['action'] for x in self.c.req('GET','/api/admin')['log'][:3]],['removed','removed','kept'])
+ def test_room_sensors_and_free_room_rule(self):
+  dev=f'test-{time.time_ns()}';iot=lambda body,code=201,token='test-iot-token':Client(self.base).req('POST','/api/iot/readings',body,code,{'X-IoT-Token':token})
+  with sqlite3.connect(self.db) as c:c.execute("INSERT INTO spaces(name,building,capacity,device_id) VALUES('Room T','Block T',8,?)",(dev,))
+  c.close();sid=next(r['id'] for r in self.a.req('GET','/api/spaces')['spaces'] if r['name']=='Room T')
+  Client(self.base).req('GET','/api/spaces',expected=401)
+  iot({'device_id':dev,'occupancy':3},401,'wrong-token');iot({'device_id':'unknown','occupancy':3},403)
+  iot({'device_id':dev,'occupancy':-1},400);iot({'device_id':dev,'occupancy':True},400)
+  self.assertEqual(iot({'device_id':dev,'occupancy':8,'battery':90})['status'],'full')
+  r=next(r for r in self.a.req('GET','/api/spaces')['spaces'] if r['id']==sid);self.assertEqual((r['status'],r['level']),('full',4));self.assertNotIn('occupancy',r)
+  self.a.req('POST','/api/spaces/watch',{'space_id':sid});self.assertTrue(next(r for r in self.a.req('GET','/api/spaces')['spaces'] if r['id']==sid)['watching'])
+  self.assertEqual(iot({'device_id':dev,'occupancy':6})['status'],'busy')
+  self.assertEqual(iot({'device_id':dev,'occupancy':1})['notified'],1)  # at most half full: the watcher is told once
+  self.assertIn('Room T',self.a.req('GET','/api/data')['notifications'][0]['text']);self.assertEqual(iot({'device_id':dev,'occupancy':0})['notified'],0)
+  self.assertEqual(next(r for r in self.a.req('GET','/api/spaces')['spaces'] if r['id']==sid)['level'],0)
+  self.a.req('POST','/api/spaces/watch',{'space_id':99999},404)
  def test_routes_and_database_integrity(self):
   for f in (ROOT/'site').glob('*.html'):self.assertIn(b'<!doctype html>',self.a.req('GET','/'+f.name))
   with sqlite3.connect(self.db) as c:self.assertEqual(c.execute('PRAGMA integrity_check').fetchone()[0],'ok');self.assertEqual(c.execute('PRAGMA foreign_key_check').fetchall(),[])

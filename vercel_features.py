@@ -207,6 +207,7 @@ def post(path,d,me):
             return 200,{'ok':True}
     if path=='/api/email/send-code':return send_code(d,me)
     if path=='/api/email/verify':return verify_code(d,me)
+    if path=='/api/spaces/watch':return watch_space(d,me)
     return None
 
 def delete(path,me):
@@ -322,3 +323,54 @@ def admin(me):
         days={'posts':{r['day']:int(r['n']) for r in c.execute(f"SELECT {DAY('sort_key')} AS day,COUNT(*) AS n FROM posts WHERE user_id IS NOT NULL AND sort_key>=? GROUP BY day",(since,))},
               'users':{r['day']:int(r['n']) for r in c.execute(f"SELECT {DAY('created_at')} AS day,COUNT(*) AS n FROM users WHERE created_at>=? GROUP BY day",(since,))}}
     return 200,{'reports':reports,'log':log,'stats':{'totals':totals,'categories':categories,'market':market,'days':days,'today':DAY_NOW()}}
+
+
+# ---- D3: study-room occupancy sensors (IoT simulation) ----------------------
+# A LoRaWAN network server would POST every uplink to /api/iot/readings; report/tools/d3_simulator.py plays
+# that role. Students only ever see free / busy / full, never a raw head count (privacy, Part D2).
+READING_TTL=30*86400;STALE_AFTER=15*60
+
+def space_status(occupancy,capacity,at,now):
+    if at is None or now-at>STALE_AFTER:return 'offline'
+    return 'free' if occupancy*2<=capacity else 'busy' if occupancy<capacity else 'full'
+
+def spaces(me):
+    now=int(time.time())
+    with s.connect() as c:
+        watching={r[0] for r in c.execute('SELECT space_id FROM space_watches WHERE user_id=?',(me['id'],))}
+        out=[]
+        for sp in c.execute('SELECT * FROM spaces ORDER BY building,name').fetchall():
+            r=c.execute('SELECT occupancy,created_at FROM space_readings WHERE space_id=? ORDER BY created_at DESC,id DESC LIMIT 1',(sp['id'],)).fetchone()
+            status=space_status(r['occupancy'],sp['capacity'],r['created_at'],now) if r else 'offline'
+            level=min(4,-(-r['occupancy']*4//sp['capacity'])) if status!='offline' else 0  # filled quarters, rounded up
+            out.append({'id':sp['id'],'name':sp['name'],'building':sp['building'],'capacity':sp['capacity'],'status':status,'level':level,
+                        'updated_at':r['created_at'] if r else None,'watching':sp['id'] in watching})
+    return 200,{'spaces':out,'now':now}
+
+def watch_space(d,me):
+    sid=number(d,'space_id');on=d.get('on') is not False
+    with s.connect() as c:
+        if not c.execute('SELECT 1 FROM spaces WHERE id=?',(sid,)).fetchone():raise s.Bad('Room not found',None,404)
+        c.execute('DELETE FROM space_watches WHERE user_id=? AND space_id=?',(me['id'],sid))
+        if on:c.execute('INSERT INTO space_watches(user_id,space_id,created_at) VALUES(?,?,?)',(me['id'],sid,int(time.time())))
+    return 200,{'watching':on}
+
+def iot_reading(d,token):
+    secret=os.environ.get('IOT_TOKEN','')
+    if not secret:return 404,{'error':'Not found'}  # off unless a sensor network is configured
+    if not isinstance(token,str) or not hmac.compare_digest(token.encode(),secret.encode()):return 401,{'error':'Bad device token'}
+    device=d.get('device_id');occ=d.get('occupancy');bat=d.get('battery',100)
+    if not isinstance(device,str) or not 0<len(device)<=40:raise s.Bad('Invalid device_id')
+    if type(occ) is not int or not 0<=occ<=500 or type(bat) is not int or not 0<=bat<=100:raise s.Bad('Invalid reading')
+    now=int(time.time())
+    with s.connect() as c:
+        sp=c.execute('SELECT * FROM spaces WHERE device_id=?',(device,)).fetchone()
+        if not sp:return 403,{'error':'Unknown device'}
+        c.execute('INSERT INTO space_readings(space_id,occupancy,battery,created_at) VALUES(?,?,?,?)',(sp['id'],occ,bat,now))
+        c.execute('DELETE FROM space_readings WHERE space_id=? AND created_at<?',(sp['id'],now-READING_TTL))
+        status=space_status(occ,sp['capacity'],now,now);notified=0
+        if status=='free':  # the rule: tell everyone waiting for this room, once
+            for w in c.execute('SELECT user_id FROM space_watches WHERE space_id=?',(sp['id'],)).fetchall():
+                notify(c,w['user_id'],f"{sp['name']} ({sp['building']}) has free seats now",'studymate.html#rooms');notified+=1
+            c.execute('DELETE FROM space_watches WHERE space_id=?',(sp['id'],))
+    return 201,{'space':sp['name'],'status':status,'notified':notified}

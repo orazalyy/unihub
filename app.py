@@ -244,6 +244,9 @@ def api_dispatch(subpath):
         if path == "/api/admin":
             u = current_user()
             return send_json(*features.admin(u)) if u else send_json(401, {"error": "Not signed in"})
+        if path == "/api/spaces":
+            u = current_user()
+            return send_json(*features.spaces(u)) if u else send_json(401, {"error": "Not signed in"})
         m = re.fullmatch(r"/api/products/(\d+)/image", path)
         if m:
             if not current_user(): return send_json(401, {"error": "Not signed in"})
@@ -280,6 +283,7 @@ def api_dispatch(subpath):
                 with connect() as c:
                     c.execute("DELETE FROM sessions WHERE token_hash=?", (hashlib.sha256(t.encode()).hexdigest(),))
             return send_json(200, {"ok": True}, ("session", "", 0))
+        if path == "/api/iot/readings": return send_json(*features.iot_reading(d, request.headers.get("X-IoT-Token")))  # sensor webhook, no session
         me = current_user()
         if not me: raise Bad("Not signed in", None, 401)
         result = features.post(path, d, me)

@@ -95,3 +95,18 @@ CREATE TABLE IF NOT EXISTS moderation_log(
 CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id,id);
 CREATE INDEX IF NOT EXISTS entries_kind ON entries(kind,university);
 CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id,id);
+-- D3: study-room occupancy sensors
+CREATE TABLE IF NOT EXISTS spaces(
+  id SERIAL PRIMARY KEY, name TEXT NOT NULL, building TEXT NOT NULL,
+  capacity INTEGER NOT NULL CHECK(capacity>0), device_id TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS space_readings(
+  id SERIAL PRIMARY KEY, space_id INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+  occupancy INTEGER NOT NULL, battery INTEGER NOT NULL, created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS space_watches(
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  space_id INTEGER NOT NULL REFERENCES spaces(id) ON DELETE CASCADE,
+  created_at BIGINT NOT NULL, PRIMARY KEY(user_id,space_id)
+);
+CREATE INDEX IF NOT EXISTS space_readings_time ON space_readings(space_id,created_at);

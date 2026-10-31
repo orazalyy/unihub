@@ -281,11 +281,57 @@ function study() {
       `${selectField('Year', 'year', [['All', 'Any year'], '1st year', '2nd year', '3rd year', '4th year', 'Graduate'], 'All')}` +
       `${selectField('Study format', 'format', [['All', 'Any format'], 'Offline', 'Online'], 'All')}` +
       `</div>${sectionHead('Your next study connection')}<p id="result-count" class="small result-count" role="status">` +
-      (`</p><div class="three-grid" id="results"></div>${groupsSection()}<div class="callout">${icon('book', 'green')}` +
+      (`</p><div class="three-grid" id="results"></div><section id="rooms" ${ROOMS ? '' : 'hidden'}>${ROOMS}</section>` +
+      `${groupsSection()}<div class="callout">${icon('book', 'green')}` +
         `<div>`) +
       `<h3>Bring your questions. Share what you know.</h3><p>The best study sessions start with a little common ground.</p>` +
       `</div><a class="button secondary" href="profile.html">Your interests</a></div>`)
   );
+}
+// D3: live room occupancy from the (simulated) door sensors; hidden when the server has no sensors.
+let ROOMS = '';
+let roomsTimer;
+const ROOM_LABEL = { free: ['Free', 'green'], busy: ['Busy', 'orange'], full: ['Full', 'red'], offline: ['No signal', 'neutral'] };
+function roomInfo(r, now) {
+  const [label, tone] = ROOM_LABEL[r.status];
+  const ago = r.updated_at ? Math.max(0, now - r.updated_at) : null;
+  return (
+    `<div class="post-head"><div><strong>${esc(r.name)}</strong><p>${esc(r.building)} · ${r.capacity} seats</p></div>${badge(label, tone)}</div>` +
+    `<div class="room-meter" role="img" aria-label="${label}">${[1, 2, 3, 4].map(i => `<span class="${i <= r.level ? tone : ''}"></span>`).join('')}</div>` +
+    `<p class="small">${ago === null ? 'No readings yet' : ago < 60 ? 'Updated just now' : `Updated ${Math.round(ago / 60)} min ago`}</p>`
+  );
+}
+const roomAction = r =>
+  r.status === 'free' ? '' : button(r.watching ? 'Stop notifying me' : 'Notify me when free', `data-room-watch="${r.id}" data-on="${!r.watching}"`);
+async function loadRooms() {
+  const root = document.getElementById('rooms');
+  if (!root) return clearInterval(roomsTimer);
+  let j;
+  try {
+    j = await api('GET', '/api/spaces');
+  } catch {
+    return;
+  }
+  const cards = j.spaces.map(r => [r.id, roomInfo(r, j.now), roomAction(r)]);
+  ROOMS = cards.length
+    ? sectionHead('Free study rooms now') +
+      `<p class="small">Live from the room door sensors · refreshed every 5 seconds · free / busy / full only, never a head count</p>` +
+      `<div class="three-grid">${cards.map(([id, info, action]) => `<article class="card panel room-card" data-room="${id}"><div class="room-info">${info}</div><div class="room-action">${action}</div></article>`).join('')}</div>`
+    : '';
+  const shown = [...root.querySelectorAll('[data-room]')].map(c => c.dataset.room).join();
+  if (shown !== cards.map(c => c[0]).join() || !cards.length) {
+    root.hidden = !ROOMS;
+    root.innerHTML = ROOMS;
+    if (ROOMS && !shown && location.hash === '#rooms') root.scrollIntoView({ behavior: 'instant' }); // opened from a "free seats" notification
+    return;
+  }
+  // Same rooms: patch only what changed, so a button stays in place unless its own label changes.
+  for (const [id, info, action] of cards) {
+    const card = root.querySelector(`[data-room="${id}"]`);
+    const [infoEl, actionEl] = card.children;
+    if (infoEl.innerHTML !== info) infoEl.innerHTML = info;
+    if (actionEl.innerHTML !== action) actionEl.innerHTML = action;
+  }
 }
 function coliving() {
   return (
@@ -454,6 +500,11 @@ function initPage() {
     }
     feedInitialized = true;
     renderFeed();
+  }
+  if (page === 'studymate') {
+    clearInterval(roomsTimer);
+    loadRooms();
+    roomsTimer = setInterval(loadRooms, 5000);
   }
   if (page === 'studymate' || page === 'coliving') {
     filters = {};
@@ -1101,15 +1152,19 @@ const reportCard = r =>
     .join(', ')} · last report ${new Date(r.last_at * 1000).toLocaleString()}</p>` +
   `<div class="record-actions">${button('Remove post', `data-mod-remove="posts/${r.post_id}"`, '')}${button('Keep post', `data-mod-dismiss="${r.post_id}"`)}</div></article>`;
 function categoryChart(s) {
-  const max = Math.max(1, ...s.categories.map(c => c.posts));
+  // Same metric as analysis question Q1: average likes + comments per post, by category.
+  const rows = s.categories
+    .map(c => ({ ...c, avg: (c.likes + c.comments) / c.posts }))
+    .sort((a, b) => b.avg - a.avg);
+  const max = Math.max(1, ...rows.map(c => c.avg));
   return (
-    `<figure class="card panel admin-chart"><figcaption><h3>Posts by feed category</h3>` +
-    `<p class="small">Bar length: number of posts · likes and comments those posts received</p></figcaption>` +
-    (s.categories
+    `<figure class="card panel admin-chart"><figcaption><h3>Engagement per post by category</h3>` +
+    `<p class="small">Bar: average likes + comments per post</p></figcaption>` +
+    (rows
       .map(
         c =>
-          `<div class="bar-row"><span>${esc(c.category)}</span><span class="bar-track"><span class="bar" style="width:${(c.posts / max) * 100}%"></span></span>` +
-          `<strong>${c.posts}</strong><small>${c.likes} likes · ${c.comments} comments</small></div>`,
+          `<div class="bar-row"><span>${esc(c.category)}</span><span class="bar-track"><span class="bar" style="width:${(c.avg / max) * 100}%"></span></span>` +
+          `<strong>${c.avg.toFixed(1)}</strong><small>${c.posts} posts · ${(c.likes / c.posts).toFixed(1)} likes and ${(c.comments / c.posts).toFixed(1)} comments per post</small></div>`,
       )
       .join('') || '<p class="small">No posts yet.</p>') +
     `<p class="small source">Source: posts, reactions and comments tables, live.</p></figure>`
@@ -1382,6 +1437,13 @@ document.addEventListener('click', e => {
       `<p>It is deleted for everyone. The author gets a notification with the reason, and the action is saved in the moderation log.</p>` +
         form(`data-endpoint="/api/admin/${b.dataset.modRemove}/remove"`, field('Reason', 'reason', 'Spam', 'text', reasons), 'Remove'),
     );
+  if (b.dataset.roomWatch)
+    act(b, async () => {
+      const on = b.dataset.on === 'true';
+      await api('POST', '/api/spaces/watch', { space_id: Number(b.dataset.roomWatch), on });
+      await loadRooms();
+      toast(on ? 'We will notify you when this room has free seats' : 'Notification turned off');
+    });
   if (b.dataset.modDismiss)
     act(b, async () => {
       await api('POST', `/api/admin/posts/${b.dataset.modDismiss}/dismiss`, {});
