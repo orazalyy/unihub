@@ -9,8 +9,17 @@ from email.message import EmailMessage
 s = None
 KINDS = {'students','roommates','events','lost','opportunities','discounts','clubs','groups'}
 
+# Any confirmed address counts as verified for the account, but the public ✓ badge needs a university address.
+UNI_DOMAINS={'AITU':('astanait.edu.kz',),'ENU':('enu.kz',),'MNU':('mnu.kz','kazguu.kz'),'Nazarbayev University':('nu.edu.kz',)}
+
+def university_email(email):
+    domain=(email or '').rsplit('@',1)[-1].strip().lower()
+    return any(domain==d or domain.endswith('.'+d) for ds in UNI_DOMAINS.values() for d in ds) or domain.endswith(('.edu.kz','.edu'))
+
+def has_badge(u): return bool(u['email_verified_at']) and university_email(u['email'])
+
 def public(u):
-    return {'id':u['id'],'name':s.short_name(u['first_name'],u['last_name']),'university':u['university'],'bio':u['bio'],'interests':u['interests'],'verified':bool(u['email_verified_at'])}
+    return {'id':u['id'],'name':s.short_name(u['first_name'],u['last_name']),'university':u['university'],'bio':u['bio'],'interests':u['interests'],'verified':has_badge(u)}
 
 IMAGE_RE = re.compile(r'data:image/(png|jpeg|webp);base64,([A-Za-z0-9+/=]+)')
 
@@ -28,13 +37,26 @@ def product_image(pid):
 def notify(c, uid, text, href):
     c.execute('INSERT INTO notifications(user_id,text,href,created_at) VALUES(?,?,?,?)',(uid,text,href,int(time.time())))
 
-def data(c, me):
+FEED_PAGE=30;FEED_MAX=3000
+
+def feed_limit(v):
+    """?posts=N from the page: how many feed posts it has loaded, 30 to 3000."""
+    return min(max(int(v), FEED_PAGE), FEED_MAX) if str(v).isdigit() else FEED_PAGE
+
+def data(c, me, limit=FEED_PAGE):
     users={u['id']:public(u) for u in c.execute('SELECT * FROM users')}
     following={r[0] for r in c.execute('SELECT target_id FROM follows WHERE user_id=?',(me,))}
     liked={r[0] for r in c.execute('SELECT post_id FROM reactions WHERE user_id=?',(me,))}
-    comments=[dict(r,name=users[r['user_id']]['name'],mine=r['user_id']==me) for r in c.execute('SELECT * FROM comments ORDER BY id')]
+    # The feed is sent in pages: the newest `limit` posts (the page asks for 30 more at a time) plus all of
+    # the user's own posts for the profile, and only the comments of the posts that are sent.
+    rows=c.execute('SELECT * FROM posts WHERE user_id IS NOT NULL ORDER BY sort_key DESC,id DESC LIMIT ?',(limit+1,)).fetchall()
+    more=len(rows)>limit;rows=rows[:limit];sent={r['id'] for r in rows}
+    rows+=[r for r in c.execute('SELECT * FROM posts WHERE user_id=? ORDER BY sort_key DESC,id DESC',(me,)).fetchall() if r['id'] not in sent]
+    ids=[r['id'] for r in rows]
+    comments=[dict(r,name=users[r['user_id']]['name'],mine=r['user_id']==me)
+              for r in c.execute(f"SELECT * FROM comments WHERE post_id IN ({','.join('?'*len(ids))}) ORDER BY id",ids)] if ids else []
     posts=[]
-    for r in c.execute('SELECT * FROM posts WHERE user_id IS NOT NULL ORDER BY sort_key DESC,id DESC'):
+    for r in rows:
         p=s.post_json(r,me)
         p.update(user_id=r['user_id'],name=users[r['user_id']]['name'],liked=r['id'] in liked,followed=r['user_id'] in following,
                  likes=c.execute('SELECT count(*) FROM reactions WHERE post_id=?',(r['id'],)).fetchone()[0], comments=sum(x['post_id']==r['id'] for x in comments))
@@ -51,7 +73,7 @@ def data(c, me):
         p['participants']=[dict(users[x['user_id']],status=x['status']) for x in rs] if p['mine'] or r['kind'] in ('groups','clubs') else []
         result[r['kind']].append(p)
     messages=[dict(r) for r in c.execute('SELECT * FROM messages WHERE sender_id=? OR recipient_id=? ORDER BY id',(me,me))]
-    result.update(posts=posts,products=products,comments=comments,users=list(users.values()),following=list(following),messages=messages,
+    result.update(posts=posts,posts_more=more,products=products,comments=comments,users=list(users.values()),following=list(following),messages=messages,
                   notifications=[dict(r) for r in c.execute('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 100',(me,))],
                   counts={u:c.execute('SELECT count(*) FROM users WHERE university=?',(u,)).fetchone()[0] for u in s.UNIVERSITIES},
                   mail_ready=s.MAIL_DEV or bool(os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASSWORD')))
@@ -374,3 +396,17 @@ def iot_reading(d,token):
                 notify(c,w['user_id'],f"{sp['name']} ({sp['building']}) has free seats now",'studymate.html#rooms');notified+=1
             c.execute('DELETE FROM space_watches WHERE space_id=?',(sp['id'],))
     return 201,{'space':sp['name'],'status':status,'notified':notified}
+
+
+# ---- log-in rate limit, kept in the database so every server instance shares it ----
+LOGIN_WINDOW=300;LOGIN_MAX_FAILS=5
+
+def login_blocked(c,login,ip,now):
+    c.execute('DELETE FROM login_failures WHERE at<?',(now-LOGIN_WINDOW,))
+    return c.execute('SELECT COUNT(*) FROM login_failures WHERE login=? AND ip=?',(login,ip)).fetchone()[0]>=LOGIN_MAX_FAILS
+
+def login_failed(c,login,ip,now):
+    c.execute('INSERT INTO login_failures(login,ip,at) VALUES(?,?,?)',(login,ip,now))
+
+def login_ok(c,login,ip):
+    c.execute('DELETE FROM login_failures WHERE login=? AND ip=?',(login,ip))

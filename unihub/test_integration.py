@@ -106,7 +106,8 @@ class Integration(unittest.TestCase):
   self.a.req('POST','/api/email/verify',{'code':'1234'},400);wrong=f'{(int(code)+1)%10**6:06d}'
   self.assertIn('4 attempts left',self.a.req('POST','/api/email/verify',{'code':wrong},400)['error'])
   u=self.a.req('POST','/api/email/verify',{'code':code});self.assertTrue(u['email_verified']);self.assertEqual(u['email'],mail)
-  self.assertTrue(next(x for x in self.b.req('GET','/api/data')['users'] if x['id']==self.ua['id'])['verified'])
+  self.assertFalse(next(x for x in self.b.req('GET','/api/data')['users'] if x['id']==self.ua['id'])['verified'])  # confirmed, but gmail gets no badge
+  self.assertFalse(u['verified_badge'])
   self.a.req('POST','/api/email/verify',{'code':code},400)  # a code works once
   self.b.req('POST','/api/email/send-code',{'email':mail.upper()},409)  # one verified account per address
   self.a.req('POST','/api/profile',dict(first_name='Alice',last_name='Tester',university='AITU',email='other@example.test'))
@@ -116,6 +117,9 @@ class Integration(unittest.TestCase):
   self.b.req('POST','/api/email/verify',{'code':code},429)  # locked after 5 wrong attempts
   self.wait_cooldown(self.ub['id']);self.b.req('POST','/api/email/send-code',{'email':'boris@example.test'})
   self.b.req('POST','/api/email/verify',{'code':self.last_code('boris@example.test')})
+  uni=f'boris{time.time_ns()}@astanait.edu.kz';self.wait_cooldown(self.ub['id']);self.b.req('POST','/api/email/send-code',{'email':uni})
+  self.assertTrue(self.b.req('POST','/api/email/verify',{'code':self.last_code(uni)})['verified_badge'])  # university address: badge
+  self.assertTrue(next(x for x in self.a.req('GET','/api/data')['users'] if x['id']==self.ub['id'])['verified'])
  def test_reports_and_moderation(self):
   pid=self.post();self.a.req('POST',f'/api/posts/{pid}/report',{'reason':'Spam'},400)  # not your own post
   self.b.req('POST',f'/api/posts/{pid}/report',{'reason':'Nonsense'},400);self.b.req('POST',f'/api/posts/{pid}/report',{'reason':'Spam'})
@@ -149,6 +153,27 @@ class Integration(unittest.TestCase):
   self.assertIn('Room T',self.a.req('GET','/api/data')['notifications'][0]['text']);self.assertEqual(iot({'device_id':dev,'occupancy':0})['notified'],0)
   self.assertEqual(next(r for r in self.a.req('GET','/api/spaces')['spaces'] if r['id']==sid)['level'],0)
   self.a.req('POST','/api/spaces/watch',{'space_id':99999},404)
+ def test_login_rate_limit_is_stored(self):
+  c=Client(self.base);login=self.uc['login']
+  for _ in range(5):c.req('POST','/api/login',dict(login=login,password='wrong-password'),401)
+  c.req('POST','/api/login',dict(login=login,password='test-password-42'),429)  # blocked even with the right password
+  with sqlite3.connect(self.db) as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM login_failures WHERE login=?',(login.lower(),)).fetchone()[0],5)
+  db.close();type(self).proc.terminate();type(self).proc.wait();type(self).start()
+  c.req('POST','/api/login',dict(login=login,password='test-password-42'),429)  # survives a restart: kept in the database
+  with sqlite3.connect(self.db) as db:db.execute('UPDATE login_failures SET at=at-301 WHERE login=?',(login.lower(),))
+  db.close();c.req('POST','/api/login',dict(login=login,password='test-password-42'))  # 5 minutes later it works
+  with sqlite3.connect(self.db) as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM login_failures WHERE login=?',(login.lower(),)).fetchone()[0],0)
+  db.close()
+ def test_feed_is_paged(self):
+  for i in range(35):self.b.req('POST','/api/posts',dict(university='AITU',category='Study',text=f'Paged {i}'),201)
+  mine=self.post();self.a.req('POST',f'/api/posts/{mine}/comments',{'text':'Old comment'})
+  for i in range(31):self.b.req('POST','/api/posts',dict(university='AITU',category='Study',text=f'Newer {i}'),201)
+  d=self.a.req('GET','/api/data');feed=[p for p in d['posts'] if not p['mine']]
+  self.assertEqual(len(feed),30);self.assertTrue(d['posts_more'])
+  self.assertTrue(any(p['id']==mine for p in d['posts']))  # own posts are always sent, for the profile
+  self.assertTrue(any(c['post_id']==mine for c in d['comments']));self.assertTrue(all(c['post_id'] in {p['id'] for p in d['posts']} for c in d['comments']))
+  self.assertEqual(len(self.a.req('GET','/api/data?posts=60')['posts']),60)  # the newest 60 already include her own post
+  self.assertEqual(len([p for p in self.a.req('GET','/api/data?posts=abc')['posts'] if not p['mine']]),30)
  def test_routes_and_database_integrity(self):
   for f in (ROOT/'site').glob('*.html'):self.assertIn(b'<!doctype html>',self.a.req('GET','/'+f.name))
   with sqlite3.connect(self.db) as c:self.assertEqual(c.execute('PRAGMA integrity_check').fetchone()[0],'ok');self.assertEqual(c.execute('PRAGMA foreign_key_check').fetchall(),[])

@@ -3038,3 +3038,7 @@ dialog video {
   background: #3a1d1b;
   color: #ff9b92;
 }
+#feed-results > [data-more-posts] {
+  display: block;
+  margin: 16px auto 4px;
+}

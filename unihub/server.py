@@ -2,7 +2,7 @@
 import json, sqlite3, time, mimetypes, os, sys, re, hashlib, hmac, secrets, datetime, gzip
 from http.cookies import SimpleCookie
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SITE = os.path.join(ROOT, "site")
@@ -76,7 +76,6 @@ def init_db():
 
 SESSION_TTL = 30 * 24 * 3600
 PUBLIC_PAGES = {"/login.html", "/register.html"}
-fails = {}  # (login, ip) -> [timestamps]
 
 def hash_pw(password, salt):
     return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
@@ -89,7 +88,7 @@ def short_name(first, last):
 def user_json(u):
     return {"bio": u["bio"], "interests": u["interests"], "community": u["community"] or u["university"], "id": u["id"], "first_name": u["first_name"], "last_name": u["last_name"], "birth_date": u["birth_date"],
             "university": u["university"], "login": u["login"], "email": u["email"], "created_at": u["created_at"],
-            "email_verified": bool(u["email_verified_at"]), "role": u["role"],
+            "email_verified": bool(u["email_verified_at"]), "verified_badge": features.has_badge(u), "role": u["role"],
             "short_name": short_name(u["first_name"], u["last_name"])}
 
 def user_from_token(token):
@@ -127,9 +126,9 @@ def product_json(r, me=None):
             "university": d["university"], "condition": d["condition"], "photo": bool(d["photo"]),
             "mine": me is not None and d["user_id"] == me}
 
-def get_all(me):
+def get_all(me, limit=None):
     with connect() as c:
-        return features.data(c, me)
+        return features.data(c, me, limit or features.FEED_PAGE)
 
 class Bad(Exception):
     def __init__(self, msg, field=None, code=400):
@@ -201,7 +200,7 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/data":
             u = self.user()
             if not u: return self.send_json(401, {"error": "Not signed in"})
-            return self.send_json(200, get_all(u["id"]))
+            return self.send_json(200, get_all(u["id"], features.feed_limit(parse_qs(urlparse(self.path).query).get("posts", [""])[0])))
         if path == "/api/admin":
             u = self.user()
             return self.send_json(*features.admin(u)) if u else self.send_json(401, {"error": "Not signed in"})
@@ -268,18 +267,20 @@ class H(BaseHTTPRequestHandler):
     def login(self, d):
         login = str(d.get("login") or "").strip()[:30]
         pw = d.get("password") if isinstance(d.get("password"), str) else ""
-        key = (login.lower(), self.client_address[0]); now = time.time()
-        fails[key] = [t for t in fails.get(key, []) if now - t < 300]
-        if len(fails[key]) >= 5:
-            raise Bad("Too many attempts. Try again in a few minutes.", None, 429)
-        with connect() as c:
-            u = c.execute("SELECT * FROM users WHERE login=?", (login,)).fetchone()
-            ok = hmac.compare_digest(hash_pw(pw[:128], u["pw_salt"] if u else DUMMY_SALT), u["pw_hash"] if u else b"\0" * 32) and u is not None
-            if not ok:
-                fails[key].append(now)
-                raise Bad("Wrong login or password", None, 401)
-            fails.pop(key, None)
-            token = new_session(c, u["id"])
+        key, ip, now, error = login.lower(), self.client_address[0], int(time.time()), None
+        with connect() as c:  # errors are raised after the block, so a failed attempt is committed
+            if features.login_blocked(c, key, ip, now):
+                error = ("Too many attempts. Try again in a few minutes.", 429)
+            else:
+                u = c.execute("SELECT * FROM users WHERE login=?", (login,)).fetchone()
+                ok = hmac.compare_digest(hash_pw(pw[:128], u["pw_salt"] if u else DUMMY_SALT), u["pw_hash"] if u else b"\0" * 32) and u is not None
+                if not ok:
+                    features.login_failed(c, key, ip, now)
+                    error = ("Wrong login or password", 401)
+                else:
+                    features.login_ok(c, key, ip)
+                    token = new_session(c, u["id"])
+        if error: raise Bad(error[0], None, error[1])
         return self.send_json(200, user_json(u), self.session_cookie(token))
 
     def do_POST(self):

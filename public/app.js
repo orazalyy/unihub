@@ -126,6 +126,9 @@ const heroImg = alt =>
 const shortUni = u => (u === 'Nazarbayev University' ? 'NU' : u);
 const universityName = () => (uni === 'Other' ? 'Student community' : uni);
 let feedInitialized = false;
+// The feed arrives in pages of 30; refreshes and polling ask for as many posts as are already shown.
+let feedLimit = 30;
+const dataUrl = () => `/api/data?posts=${feedLimit}`;
 let filters = {},
   feedTab = 'For You',
   feedCategory = 'All';
@@ -435,7 +438,7 @@ function render() {
       `${navLink('settings', 'Settings', 'settings')}${isAdmin() ? navLink('admin', 'Moderation', 'shield') : ''}</nav>`) +
     (`<button class="logout-btn" data-logout>Log out</button><a class="sidebar-profile" href="profile.html">${avatar(ME.short_name, 'blue')}` +
       `<span>`) +
-    `<strong>${esc(ME.first_name)} ${verifiedMark(ME.email_verified)}</strong><small>${universityName()}</small>` +
+    `<strong>${esc(ME.first_name)} ${verifiedMark(ME.verified_badge)}</strong><small>${universityName()}</small>` +
     (`</span></a></div></aside><div class="workspace"><header class="topbar"><button class="menu-button" data-menu aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">${svg('menu')}` +
       `</button>`) +
     (`<div><span class="breadcrumb">UniHub</span><span class="crumb-slash">/</span><strong>${titles[page]}` +
@@ -674,6 +677,7 @@ function renderFeed() {
   document.getElementById('feed-results').innerHTML = result.length
     ? result.map(postCard).join('')
     : blank('No posts yet', 'Publish a post or follow someone to see their updates here.');
+  if (DB.posts_more) document.getElementById('feed-results').innerHTML += button('Show older posts', 'data-more-posts');
   document.getElementById('feed-caption').textContent = `${result.length} posts · ${feedTab}`;
 }
 function ownerActions(kind, p) {
@@ -815,7 +819,7 @@ function profile() {
       `<p>@${esc(ME.login)} · ${esc(ME.university)}</p><p class="small">University selected by the member</p>` +
       `<p>${esc(ME.bio || 'Tell your campus a little about yourself.')}</p><p>${esc(ME.interests)}</p>` +
       `<div class="profile-facts"><div><span>Date of birth (private)</span><strong>${esc(ME.birth_date)}</strong>` +
-      `</div><div><span>Email (private)</span><strong>${esc(ME.email || 'Not added')} ${verifiedMark(ME.email_verified)}</strong>` +
+      `</div><div><span>Email (private)</span><strong>${esc(ME.email || 'Not added')} ${verifiedMark(ME.verified_badge)}</strong>` +
       `${ME.email_verified || !DB.mail_ready ? '' : button('Verify email', 'data-verify-email')}` +
       (`</div></div></aside><div><div class="profile-stats"><div class="card"><strong>${posts().filter(p => p.mine).length}` +
         `</strong>`) +
@@ -862,10 +866,13 @@ function settings() {
       (`<section class="card panel"><h2>Your account</h2>${button('Edit profile', 'data-profile')}` +
         `${button('Change password', 'data-password')}<p class="small">Changing your password signs out all sessions.</p>`) +
       `</section><section class="card panel"><h2>Email verification</h2>` +
-      (ME.email_verified
+      (ME.verified_badge
         ? `<p>${verifiedMark(true)} <strong>${esc(ME.email)}</strong> is verified. Other students see the badge next to your name.</p>` +
           button('Use another email', 'data-verify-email')
-        : `<p>Confirm your email with a one-time code to get the verified badge ${verifiedMark(true)} next to your name.</p>` +
+        : ME.email_verified
+          ? `<p><strong>${esc(ME.email)}</strong> is confirmed. The badge ${verifiedMark(true)} is given only for a university address, for example @astanait.edu.kz or @nu.edu.kz.</p>` +
+            button('Use a university email', 'data-verify-email')
+        : `<p>Confirm your university email with a one-time code to get the verified badge ${verifiedMark(true)} next to your name.</p>` +
           (DB.mail_ready
             ? button('Verify email', 'data-verify-email', '')
             : '<p class="small">Sending codes is not switched on for this server yet.</p>')) +
@@ -1245,7 +1252,7 @@ function commentsDialog(id) {
   );
 }
 async function refresh() {
-  DB = await api('GET', '/api/data');
+  DB = await api('GET', dataUrl());
   ME = await api('GET', '/api/me');
   uni = ME.community;
   render();
@@ -1437,6 +1444,12 @@ document.addEventListener('click', e => {
       `<p>It is deleted for everyone. The author gets a notification with the reason, and the action is saved in the moderation log.</p>` +
         form(`data-endpoint="/api/admin/${b.dataset.modRemove}/remove"`, field('Reason', 'reason', 'Spam', 'text', reasons), 'Remove'),
     );
+  if (b.hasAttribute('data-more-posts'))
+    act(b, async () => {
+      feedLimit += 30;
+      DB = await api('GET', dataUrl());
+      renderFeed();
+    });
   if (b.dataset.roomWatch)
     act(b, async () => {
       const on = b.dataset.on === 'true';
@@ -1534,7 +1547,7 @@ document.addEventListener('submit', async e => {
     if (f.id === 'message-form') {
       await api('POST', '/api/messages', { user_id: chatUser, text: d.text });
       f.reset();
-      DB = await api('GET', '/api/data');
+      DB = await api('GET', dataUrl());
       chatHistory();
       return;
     }
@@ -1614,7 +1627,7 @@ setInterval(async () => {
   if (!ME || document.hidden || polling) return;
   polling = true;
   try {
-    const data = await api('GET', '/api/data');
+    const data = await api('GET', dataUrl());
     DB = data;
     const unread = DB.messages.filter(m => m.recipient_id === ME.id && !m.read_at).length;
     const link = document.querySelector('a[href="messages.html"] span');

@@ -110,3 +110,6 @@ CREATE TABLE IF NOT EXISTS space_watches(
   created_at BIGINT NOT NULL, PRIMARY KEY(user_id,space_id)
 );
 CREATE INDEX IF NOT EXISTS space_readings_time ON space_readings(space_id,created_at);
+-- failed log-ins of the last 5 minutes, shared by all serverless instances
+CREATE TABLE IF NOT EXISTS login_failures(login TEXT NOT NULL, ip TEXT NOT NULL, at BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS login_failures_key ON login_failures(login,ip);

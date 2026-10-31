@@ -24,7 +24,6 @@ POSTGRES = True
 MAIL_DEV = os.environ.get("MAIL_DEV") == "1"
 
 SESSION_TTL = 30 * 24 * 3600
-fails = {}  # (login, ip) -> [timestamps]; per-instance only, see README-VERCEL.md
 
 _SCHEMA_SQL = (pathlib.Path(__file__).parent / "schema_postgres.sql").read_text(encoding="utf-8")
 _schema_ready = False
@@ -58,7 +57,7 @@ def short_name(first, last):
 def user_json(u):
     return {"bio": u["bio"], "interests": u["interests"], "community": u["community"] or u["university"], "id": u["id"], "first_name": u["first_name"], "last_name": u["last_name"], "birth_date": u["birth_date"],
             "university": u["university"], "login": u["login"], "email": u["email"], "created_at": u["created_at"],
-            "email_verified": bool(u["email_verified_at"]), "role": u["role"],
+            "email_verified": bool(u["email_verified_at"]), "verified_badge": features.has_badge(u), "role": u["role"],
             "short_name": short_name(u["first_name"], u["last_name"])}
 
 
@@ -104,9 +103,9 @@ def product_json(r, me=None):
             "mine": me is not None and d["user_id"] == me}
 
 
-def get_all(me):
+def get_all(me, limit=None):
     with connect() as c:
-        return features.data(c, me)
+        return features.data(c, me, limit or features.FEED_PAGE)
 
 
 class Bad(Exception):
@@ -215,18 +214,23 @@ def register(d):
 def login(d):
     login_ = str(d.get("login") or "").strip()[:30]
     pw = d.get("password") if isinstance(d.get("password"), str) else ""
-    key = (login_.lower(), request.remote_addr); now = time.time()
-    fails[key] = [t for t in fails.get(key, []) if now - t < 300]
-    if len(fails[key]) >= 5:
-        raise Bad("Too many attempts. Try again in a few minutes.", None, 429)
-    with connect() as c:
-        u = c.execute("SELECT * FROM users WHERE login=?", (login_,)).fetchone()
-        ok = hmac.compare_digest(hash_pw(pw[:128], u["pw_salt"] if u else DUMMY_SALT), u["pw_hash"] if u else b"\0" * 32) and u is not None
-        if not ok:
-            fails[key].append(now)
-            raise Bad("Wrong login or password", None, 401)
-        fails.pop(key, None)
-        token = new_session(c, u["id"])
+    # Behind Vercel's proxy remote_addr is 127.0.0.1; Vercel sets X-Real-IP / X-Forwarded-For to the client's
+    # address and overwrites any value the client sends.
+    ip = request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr or ""
+    key, now, error = login_.lower(), int(time.time()), None
+    with connect() as c:  # errors are raised after the block, so a failed attempt is committed
+        if features.login_blocked(c, key, ip, now):
+            error = ("Too many attempts. Try again in a few minutes.", 429)
+        else:
+            u = c.execute("SELECT * FROM users WHERE login=?", (login_,)).fetchone()
+            ok = hmac.compare_digest(hash_pw(pw[:128], u["pw_salt"] if u else DUMMY_SALT), u["pw_hash"] if u else b"\0" * 32) and u is not None
+            if not ok:
+                features.login_failed(c, key, ip, now)
+                error = ("Wrong login or password", 401)
+            else:
+                features.login_ok(c, key, ip)
+                token = new_session(c, u["id"])
+    if error: raise Bad(error[0], None, error[1])
     return send_json(200, user_json(u), session_cookie(token))
 
 
@@ -244,7 +248,7 @@ def api_dispatch(subpath):
         if path == "/api/data":
             u = current_user()
             if not u: return send_json(401, {"error": "Not signed in"})
-            return send_json(200, get_all(u["id"]))
+            return send_json(200, get_all(u["id"], features.feed_limit(request.args.get("posts", ""))))
         if path == "/api/admin":
             u = current_user()
             return send_json(*features.admin(u)) if u else send_json(401, {"error": "Not signed in"})
