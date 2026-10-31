@@ -3,3 +3,6 @@ report/
 unihub/screenshots/
 *.db
 .venv/
+.env*
+HANDOFF.md
+.claude/
