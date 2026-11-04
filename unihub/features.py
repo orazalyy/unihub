@@ -370,9 +370,9 @@ def admin(me):
     return 200,{'reports':reports,'log':log,'stats':{'totals':totals,'categories':categories,'market':market,'days':days,'today':DAY_NOW()}}
 
 
-# ---- D3: study-room occupancy sensors (IoT simulation) ----------------------
-# A LoRaWAN network server would POST every uplink to /api/iot/readings; report/tools/d3_simulator.py plays
-# that role. Students only ever see free / busy / full, never a raw head count (privacy, Part D2).
+# ---- study-room occupancy sensors (IoT simulation) ----------------------
+# A LoRaWAN network server would POST every uplink to /api/iot/readings; unihub/sensor_sim.py plays
+# that role. Students only ever see free / busy / full, never a raw head count (privacy).
 READING_TTL=30*86400;STALE_AFTER=15*60
 
 def space_status(occupancy,capacity,at,now):
